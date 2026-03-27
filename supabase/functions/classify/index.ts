@@ -1,24 +1,50 @@
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
-const AIRTABLE_TABLES: Record<string, string> = {
-  'Blog Posts': 'tblevAnAAPpsREQXi',
-  'Social Media Posts': 'tblNv9mvkEaz7Pf9E',
-  'Email Campaigns': 'tblM2nkYOGaTJJcVb',
-  'Instagram Stories': 'tblAt8cbZRfTSInSd',
-  'Video Youtube': 'tblYJqkIMEebhzlJs',
-}
+// Converte schema_snapshot Airtable in testo per il prompt
+function schemaToPromptText(schema: any): { promptText: string, tableMap: Record<string, { id: string, titleField: string }> } {
+  const tableMap: Record<string, { id: string, titleField: string }> = {}
+  const lines: string[] = []
 
-const AIRTABLE_BASE = 'app70Q7WUIlmNUJr4'
+  for (const table of schema.tables) {
+    lines.push(`### Tabella: ${table.name}`)
+    tableMap[table.name] = { id: table.id, titleField: '' }
 
-const TITLE_FIELDS: Record<string, string> = {
-  'Blog Posts': 'Title',
-  'Social Media Posts': 'Name',
-  'Email Campaigns': 'Nome',
-  'Instagram Stories': 'Name',
-  'Video Youtube': 'Titolo video',
+    for (const field of table.fields) {
+      // Salta campi non mappabili da input vocale
+      if (['formula', 'rollup', 'lookup', 'createdTime', 'lastModifiedTime', 'createdBy', 'lastModifiedBy', 'autoNumber', 'button'].includes(field.type)) {
+        continue
+      }
+
+      let fieldDesc = `- ${field.name} (${field.type})`
+
+      if (field.type === 'singleSelect' && field.options?.choices) {
+        const options = field.options.choices.map((c: any) => c.name).join(' | ')
+        fieldDesc += `: ${options}`
+      }
+      if (field.type === 'multipleSelects' && field.options?.choices) {
+        const options = field.options.choices.map((c: any) => c.name).join(' | ')
+        fieldDesc += `: ${options}`
+      }
+      if (field.type === 'date') {
+        fieldDesc += ' — NON compilare mai'
+      }
+
+      // Trova il campo titolo (primo campo singleLineText o il campo primary)
+      if (field.type === 'singleLineText' && !tableMap[table.name].titleField) {
+        tableMap[table.name].titleField = field.name
+      }
+
+      lines.push(fieldDesc)
+    }
+    lines.push('')
+  }
+
+  return { promptText: lines.join('\n'), tableMap }
 }
 
 Deno.serve(async (req) => {
@@ -27,61 +53,50 @@ Deno.serve(async (req) => {
   }
 
   try {
-    const { transcript } = await req.json()
+    const { transcript, user_id } = await req.json()
+
+    if (!transcript || !user_id) {
+      throw new Error('transcript e user_id sono obbligatori')
+    }
 
     const anthropicKey = Deno.env.get('ANTHROPIC_API_KEY')
-    const airtableToken = Deno.env.get('AIRTABLE_TOKEN')
+
+    // Legge connessione e schema da Supabase
+    const supabase = createClient(
+      Deno.env.get('SUPABASE_URL')!,
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+    )
+
+    const { data: connection, error: connError } = await supabase
+      .from('connections')
+      .select('access_token, database_id, schema_snapshot')
+      .eq('user_id', user_id)
+      .eq('platform', 'airtable')
+      .single()
+
+    if (connError || !connection) {
+      throw new Error('Nessuna connessione Airtable trovata per questo utente')
+    }
+
+    const { access_token, database_id, schema_snapshot } = connection
+    const { promptText, tableMap } = schemaToPromptText(schema_snapshot)
 
     const prompt = `Sei un assistente per la gestione di contenuti. Il tuo compito è analizzare un'idea di contenuto dettata a voce e classificarla secondo lo schema del database.
 
 ## Schema del database
 
-### Tabella: Blog Posts
-- Title (title): testo libero — titolo o gancio dell'articolo
-- Tema (multi_select): Ecosistemi | Ordine digitale | Task&Project management | Social | Automazioni | SOP | Mindset | Tool
-- Status (single_select): Bozza | Idea | Da revisionare | Pianificato | Pubblicato
-- Funnel (single_select): ToFu | MoFu | BoFu
-- Tipologia articolo (multi_select): Pillar | Cluster | Case study
-- Publication Date (date): data
-- Body (rich_text): testo libero
-
-### Tabella: Social Media Posts
-- Name (title): testo libero — gancio o titolo del post
-- Post Content (rich_text): testo libero — testo del post o idea
-- Tipo contenuto (single_select): Carosello | Reel
-- CTA (multi_select): Commenta | Salva | Like | Follow | Share | DM/Manychat
-- Scheduled Date (date): data
-
-### Tabella: Email Campaigns
-- Nome (title): testo libero — oggetto o titolo della campagna
-- Oggetto (rich_text): testo libero
-- Preheader (rich_text): testo libero
-- Corpo (rich_text): testo libero — contenuto o idea
-- Type (single_select): Flow Letter | DEM
-- Data invio (date): data
-
-### Tabella: Instagram Stories
-- Name (title): testo libero — titolo o idea della story
-- Notes (rich_text): testo libero — contenuto o idea
-- Tema (multi_select): Ecosistemi | Ordine digitale | Task&Project management | Social | Automazioni | SOP | Mindset | Tool
-- Data pubblicazione (date): data
-
-### Tabella: Video Youtube
-- Titolo video (title): testo libero — titolo del video
-- Descrizione Video (rich_text): testo libero — idea o scaletta
-- Tag Video (rich_text): testo libero — parole chiave
-- Data Pubblicazione (date): data
+${promptText}
 
 ## Regole di classificazione
 
 1. ANALIZZA il contenuto dettato e determina in quale tabella (o tabelle) va inserito.
 2. Per ogni tabella in cui il contenuto va inserito, COMPILA tutti i campi che puoi dedurre.
-3. Se un campo ha opzioni predefinite (single_select/multi_select), usa SOLO le opzioni esistenti.
+3. Se un campo ha opzioni predefinite (singleSelect/multipleSelects), usa SOLO le opzioni esistenti.
 4. Se non puoi determinare con certezza il valore di un campo, omettilo.
 5. Se il contenuto è adatto a più tabelle, crea un record per ogni tabella.
 6. Il campo titolo va sempre compilato.
-7. Per i campi single_select restituisci una stringa, per i multi_select restituisci un array.
-8. Non compilare mai campi di tipo data. I record sono sempre bozze o idee: la data viene gestita manualmente in un secondo momento.
+7. Per i campi singleSelect restituisci una stringa, per i multipleSelects restituisci un array.
+8. Non compilare mai campi di tipo date.
 
 ## Contenuto dettato
 
@@ -96,7 +111,7 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
     {
       "table": "nome esatto della tabella",
       "fields": {
-        "nome_campo": "valore per title/text/single_select",
+        "nome_campo": "valore per singleLineText/multilineText/singleSelect",
         "nome_campo_multi": ["valore1", "valore2"]
       },
       "confidence": "high" | "medium" | "low",
@@ -127,19 +142,19 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
     const airtableResults = []
 
     for (const record of classification.records) {
-      const tableId = AIRTABLE_TABLES[record.table]
-      if (!tableId) {
-        airtableResults.push({ table: record.table, status: 'error', message: 'Tabella non trovata' })
+      const tableInfo = tableMap[record.table]
+      if (!tableInfo) {
+        airtableResults.push({ table: record.table, status: 'error', message: 'Tabella non trovata nello schema' })
         continue
       }
 
       // Aggiunge prefisso ⚡ al campo titolo
-      const titleField = TITLE_FIELDS[record.table]
+      const titleField = tableInfo.titleField
       if (titleField && record.fields[titleField]) {
         record.fields[titleField] = `⚡ ${record.fields[titleField]}`
       }
 
-      // Rimuove eventuali campi data (sicurezza aggiuntiva)
+      // Rimuove campi data per sicurezza
       for (const key of Object.keys(record.fields)) {
         const value = record.fields[key]
         if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) {
@@ -148,11 +163,11 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
       }
 
       const airtableResponse = await fetch(
-        `https://api.airtable.com/v0/${AIRTABLE_BASE}/${tableId}`,
+        `https://api.airtable.com/v0/${database_id}/${tableInfo.id}`,
         {
           method: 'POST',
           headers: {
-            'Authorization': `Bearer ${airtableToken}`,
+            'Authorization': `Bearer ${access_token}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ fields: record.fields }),
@@ -164,7 +179,7 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
       if (airtableResponse.ok) {
         airtableResults.push({ table: record.table, status: 'success', id: airtableData.id })
       } else {
-        airtableResults.push({ table: record.table, status: 'error', message: airtableData.error?.message })
+        airtableResults.push({ table: record.table, status: 'error', message: JSON.stringify(airtableData) })
       }
     }
 
