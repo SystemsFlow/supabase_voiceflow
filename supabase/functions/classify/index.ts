@@ -155,11 +155,13 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
 
     // Scrivi in Airtable
     const airtableResults = []
+    const airtableErrors: Record<string, any> = {}
 
     for (const record of classification.records) {
       const tableInfo = tableMap[record.table]
       if (!tableInfo) {
         airtableResults.push({ table: record.table, status: 'error', message: 'Tabella non trovata nello schema' })
+        airtableErrors[record.table] = 'Tabella non trovata nello schema'
         continue
       }
 
@@ -197,20 +199,26 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
           title: record.fields[tableInfo.titleField] ?? null,
         })
       } else {
+        const errorMsg = JSON.stringify(airtableData)
         airtableResults.push({
           table: record.table,
           status: 'error',
-          message: JSON.stringify(airtableData),
+          message: errorMsg,
         })
+        airtableErrors[record.table] = airtableData
       }
     }
 
-    // Aggiorna log con esito finale
+    // Aggiorna log con esito finale + eventuali errori Airtable
     const allSuccess = airtableResults.every((r: any) => r.status === 'success')
     if (logId) {
       await supabase
         .from('content_logs')
-        .update({ status: allSuccess ? 'success' : 'error' })
+        .update({
+          status: allSuccess ? 'success' : 'error',
+          // Se ci sono errori Airtable, li salva nel campo classification
+          ...(!allSuccess && { classification: { ...classification, airtable_errors: airtableErrors } }),
+        })
         .eq('id', logId)
     }
 
@@ -220,11 +228,13 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
     )
 
   } catch (error) {
-    // Se il log esiste già, aggiornalo a error
     if (logId) {
       await supabase
         .from('content_logs')
-        .update({ status: 'error' })
+        .update({
+          status: 'error',
+          classification: { error: error.message },
+        })
         .eq('id', logId)
     }
 
