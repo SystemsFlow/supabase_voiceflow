@@ -5,7 +5,6 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
-// Converte schema_snapshot Airtable in testo per il prompt
 function schemaToPromptText(schema: any): { promptText: string, tableMap: Record<string, { id: string, titleField: string }> } {
   const tableMap: Record<string, { id: string, titleField: string }> = {}
   const lines: string[] = []
@@ -15,7 +14,6 @@ function schemaToPromptText(schema: any): { promptText: string, tableMap: Record
     tableMap[table.name] = { id: table.id, titleField: '' }
 
     for (const field of table.fields) {
-      // Salta campi non mappabili da input vocale
       if (['formula', 'rollup', 'lookup', 'createdTime', 'lastModifiedTime', 'createdBy', 'lastModifiedBy', 'autoNumber', 'button'].includes(field.type)) {
         continue
       }
@@ -34,7 +32,6 @@ function schemaToPromptText(schema: any): { promptText: string, tableMap: Record
         fieldDesc += ' — NON compilare mai'
       }
 
-      // Trova il campo titolo (primo campo singleLineText o il campo primary)
       if (field.type === 'singleLineText' && !tableMap[table.name].titleField) {
         tableMap[table.name].titleField = field.name
       }
@@ -52,6 +49,13 @@ Deno.serve(async (req) => {
     return new Response('ok', { headers: corsHeaders })
   }
 
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+  )
+
+  let logId: string | null = null
+
   try {
     const { transcript, user_id } = await req.json()
 
@@ -60,12 +64,6 @@ Deno.serve(async (req) => {
     }
 
     const anthropicKey = Deno.env.get('ANTHROPIC_API_KEY')
-
-    // Legge connessione e schema da Supabase
-    const supabase = createClient(
-      Deno.env.get('SUPABASE_URL')!,
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-    )
 
     const { data: connection, error: connError } = await supabase
       .from('connections')
@@ -120,7 +118,7 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
   ]
 }`
 
-    // Chiamata Claude API
+    // Chiama Claude
     const claudeResponse = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -138,7 +136,24 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
     const claudeData = await claudeResponse.json()
     const classification = JSON.parse(claudeData.content[0].text)
 
-    // Scrittura in Airtable
+    // Scrivi log PRIMA di chiamare Airtable
+    const targetTables = classification.records.map((r: any) => r.table).join(', ')
+    const { data: logData } = await supabase
+      .from('content_logs')
+      .insert({
+        user_id,
+        transcript,
+        classification,
+        target_table: targetTables,
+        status: 'pending',
+        cost_cents: 5,
+      })
+      .select('id')
+      .single()
+
+    logId = logData?.id ?? null
+
+    // Scrivi in Airtable
     const airtableResults = []
 
     for (const record of classification.records) {
@@ -148,13 +163,11 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
         continue
       }
 
-      // Aggiunge prefisso ⚡ al campo titolo
       const titleField = tableInfo.titleField
       if (titleField && record.fields[titleField]) {
         record.fields[titleField] = `⚡ ${record.fields[titleField]}`
       }
 
-      // Rimuove campi data per sicurezza
       for (const key of Object.keys(record.fields)) {
         const value = record.fields[key]
         if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) {
@@ -177,10 +190,28 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
       const airtableData = await airtableResponse.json()
 
       if (airtableResponse.ok) {
-        airtableResults.push({ table: record.table, status: 'success', id: airtableData.id })
+        airtableResults.push({
+          table: record.table,
+          status: 'success',
+          id: airtableData.id,
+          title: record.fields[tableInfo.titleField] ?? null,
+        })
       } else {
-        airtableResults.push({ table: record.table, status: 'error', message: JSON.stringify(airtableData) })
+        airtableResults.push({
+          table: record.table,
+          status: 'error',
+          message: JSON.stringify(airtableData),
+        })
       }
+    }
+
+    // Aggiorna log con esito finale
+    const allSuccess = airtableResults.every((r: any) => r.status === 'success')
+    if (logId) {
+      await supabase
+        .from('content_logs')
+        .update({ status: allSuccess ? 'success' : 'error' })
+        .eq('id', logId)
     }
 
     return new Response(
@@ -189,6 +220,14 @@ Rispondi ESCLUSIVAMENTE con un JSON valido, senza testo aggiuntivo, senza markdo
     )
 
   } catch (error) {
+    // Se il log esiste già, aggiornalo a error
+    if (logId) {
+      await supabase
+        .from('content_logs')
+        .update({ status: 'error' })
+        .eq('id', logId)
+    }
+
     return new Response(
       JSON.stringify({ error: error.message }),
       { status: 400, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
